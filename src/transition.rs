@@ -72,9 +72,10 @@ pub(crate) static TRANSITION_REGISTRY: LazyLock<TransitionRegistry> = LazyLock::
     TransitionRegistry {
         initialized: AtomicBool::new(false),
         rem_size: RwLock::new(Pixels::from(16.)),
-        states: Default::default(),
-        active_animations: Default::default(),
-        saved_contexts: Default::default(),
+        // PERF 3: 预分配容量 + 固定 4 分片，减少锁竞争和 rehash
+        states: DashMap::with_capacity_and_shard_amount(64, 4),
+        active_animations: DashMap::with_capacity_and_shard_amount(32, 4),
+        saved_contexts: DashMap::with_capacity_and_shard_amount(16, 4),
         wakeup_tx: tx,
         wakeup_rx: rx,
     }
@@ -82,8 +83,12 @@ pub(crate) static TRANSITION_REGISTRY: LazyLock<TransitionRegistry> = LazyLock::
 
 impl TransitionRegistry {
     pub fn init(window: &mut Window, cx: &mut App) {
+        let new_rem = window.rem_size();
+        if *TRANSITION_REGISTRY.rem_size.read() != new_rem {
+            *TRANSITION_REGISTRY.rem_size.write() = new_rem;
+        }
+
         if !TRANSITION_REGISTRY.initialized.swap(true, Ordering::SeqCst) {
-            *TRANSITION_REGISTRY.rem_size.write() = window.rem_size();
             cx.spawn(Self::animation_tick).detach();
         }
     }
@@ -142,59 +147,72 @@ impl TransitionRegistry {
             },
         );
 
-        TRANSITION_REGISTRY.wakeup_tx.try_send(()).ok();
+        if TRANSITION_REGISTRY.wakeup_tx.try_send(()).is_err() {
+            #[cfg(debug_assertions)]
+            eprintln!("[gpui-animation] wakeup channel closed, animation tick may be dead");
+        }
     }
 
     pub async fn animation_tick(cx: &mut AsyncApp) {
-        // least 120TPS
         let frame_duration = Duration::from_secs_f32(1. / 120.);
         let registry = &*TRANSITION_REGISTRY;
 
+        let mut ids: Vec<ElementId> = Vec::with_capacity(32);
+        let mut completed: Vec<(ElementId, Duration, Arc<dyn Transition>)> = Vec::with_capacity(8);
+
         loop {
+            ids.clear();
+            completed.clear();
+
+            ids.extend(registry.active_animations.iter().map(|e| e.key().clone()));
+
             let mut changed = false;
-            let removed = DashMap::new();
 
-            {
-                registry.active_animations.retain(|id, active| {
-                    if let Some(mut state) = registry.states.get_mut(id) {
-                        changed = true;
+            for id in &ids {
+                let Some(active) = registry.active_animations.get(id) else {
+                    continue;
+                };
+                let Some(mut state) = registry.states.get_mut(id) else {
+                    drop(active);
+                    registry.active_animations.remove(id);
+                    continue;
+                };
 
-                        if state.animated(
-                            active.ver,
-                            active.duration,
-                            &active.transition,
-                            active.persistent,
-                        ) {
-                            if active.event.ne(&Event::NONE) {
-                                state.priority = AnimationPriority::Lowest;
-                                removed.insert(
-                                    id.clone(),
-                                    (active.origin_duration, active.transition.clone()),
-                                );
-                            }
+                changed = true;
 
-                            false
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
+                let done = state.animated(
+                    active.ver,
+                    active.duration,
+                    &active.transition,
+                    active.persistent,
+                );
+
+                if done {
+                    if active.event.ne(&Event::NONE) {
+                        state.priority = AnimationPriority::Lowest;
+                        completed.push((
+                            id.clone(),
+                            active.origin_duration,
+                            active.transition.clone(),
+                        ));
                     }
-                });
+                    drop(active);
+                    drop(state);
+                    registry.active_animations.remove(id);
+                }
             }
 
-            if changed {
+            let still_animating = !registry.active_animations.is_empty();
+            if changed && still_animating {
                 cx.update(|cx| cx.refresh_windows()).ok();
             }
 
-            registry.states.iter_mut().for_each(|mut state| {
-                if state.progress >= 1. {
-                    if let Some((id, ctx)) = registry.saved_contexts.remove(state.key()) {
+            for (id, origin_duration, transition) in &completed {
+                if let Some((_, ctx)) = registry.saved_contexts.remove(id) {
+                    if let Some(mut state) = registry.states.get_mut(id) {
                         state.priority = ctx.priority;
                         state.to = ctx.style;
-
                         let (ver, dt) = state.pre_animated(ctx.duration);
-
                         Self::background_animated_task(
                             id.clone(),
                             ctx.event.clone(),
@@ -204,33 +222,26 @@ impl TransitionRegistry {
                             ver,
                             true,
                         );
-                    } else if let Some(active_anim) = registry.active_animations.get(state.key())
-                        && !active_anim.persistent
-                    {
-                        state.priority = AnimationPriority::Lowest;
-
-                        let mut fallback = None;
-                        if let Some((_, cur_anim)) = removed.remove(state.key()) {
-                            let (ver, dt) = state.pre_animated(cur_anim.0);
-                            fallback = Some((ver, dt, cur_anim.1));
-                        }
-
-                        if let Some((ver, dt, transition)) = fallback {
-                            state.to = state.origin.clone();
-
-                            Self::background_animated_task(
-                                state.key().clone(),
-                                Event::NONE,
-                                dt,
-                                dt,
-                                transition,
-                                ver,
-                                false,
-                            );
-                        }
                     }
+                } else if let Some(mut state) = registry.states.get_mut(id) {
+                    state.priority = AnimationPriority::Lowest;
+                    let (ver, dt) = state.pre_animated(*origin_duration);
+                    state.to = state.origin.clone();
+                    Self::background_animated_task(
+                        id.clone(),
+                        Event::NONE,
+                        dt,
+                        dt,
+                        transition.clone(),
+                        ver,
+                        false,
+                    );
                 }
-            });
+            }
+
+            if changed && !still_animating {
+                cx.update(|cx| cx.refresh_windows()).ok();
+            }
 
             if registry.active_animations.is_empty() {
                 registry.wakeup_rx.recv().await.ok();

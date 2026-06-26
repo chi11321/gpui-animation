@@ -508,7 +508,7 @@ impl<T: FastInterpolatable + Default + PartialEq> State<T> {
     }
 
     pub(crate) fn pre_animated(&mut self, dt: Duration) -> (usize, Duration) {
-        self.version += 1;
+        self.version = self.version.wrapping_add(1);
 
         let is_reversing = self.to == self.from;
 
