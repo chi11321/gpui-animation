@@ -1,6 +1,6 @@
 [package]
 name = "gpui-animation"
-version = "0.2.51"
+version = "0.2.52"
 authors = ["ch1ll321 <earlysun.984190929@gmail.com>"]
 license = "MIT OR Apache-2.0"
 keywords = ["gpui", "animation", "ui", "transition"]

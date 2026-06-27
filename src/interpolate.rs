@@ -431,6 +431,7 @@ impl FastInterpolatable for StyleRefinement {
         fast_refine_interp!(self, other, corner_radii, t, out);
         fast_optional_refine_interp!(self, other, box_shadow, t, out);
         fast_optional_refine_interp!(self, other, opacity, t, out);
+        fast_refine_interp!(self, other, inset, t, out);
 
         match (&self.text, &other.text) {
             (Some(from), Some(to)) => {
