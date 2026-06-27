@@ -411,6 +411,16 @@ impl<T: Interpolatable> Interpolatable for Vec<T> {
     }
 }
 
+impl<T: Interpolatable> Interpolatable for Option<T> {
+    #[inline]
+    fn interpolate(&self, other: &Self, t: f32) -> Self {
+        match (self, other) {
+            (Some(a), Some(b)) => Some(a.interpolate(b, t)),
+            _ => other.clone(),
+        }
+    }
+}
+
 impl FastInterpolatable for StyleRefinement {
     #[inline]
     fn fast_interpolate(&self, other: &Self, t: f32, out: &mut Self) {

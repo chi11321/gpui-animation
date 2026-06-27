@@ -1,6 +1,8 @@
 pub mod animation;
 pub mod transition;
 
+mod transform;
+
 pub(crate) mod interpolate;
 
 /// Reset all animation state associated with the given element ID.
