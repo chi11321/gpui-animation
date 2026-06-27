@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "gpui-animation"
-version = "0.2.6"
+version = "0.2.60"
 dependencies = [
  "dashmap",
  "gpui",
