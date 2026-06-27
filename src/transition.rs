@@ -278,4 +278,15 @@ impl TransitionRegistry {
 
         TRANSITION_REGISTRY.states.get_mut(&id)
     }
+
+    /// Remove the stored animation state for an element.
+    /// Call this when an element is about to be removed from the view tree
+    /// (e.g. on click before navigating away) so that stale hover/click
+    /// animation state does not persist and reappear when the element is
+    /// re-rendered later.
+    pub fn reset_state(id: &ElementId) {
+        TRANSITION_REGISTRY.states.remove(id);
+        TRANSITION_REGISTRY.active_animations.remove(id);
+        TRANSITION_REGISTRY.saved_contexts.remove(id);
+    }
 }
