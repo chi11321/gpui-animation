@@ -37,11 +37,21 @@ macro_rules! refine_interp {
 
 macro_rules! fast_optional_refine_interp {
     ($self:expr, $other:expr, $field:ident, $t:expr, $out:expr) => {
-        if let Some(a) = $self.$field.as_ref()
-            && let Some(b) = $other.$field.as_ref()
-            && a.ne(b)
-        {
-            $out.$field = Some(a.interpolate(b, $t));
+        match ($self.$field.as_ref(), $other.$field.as_ref()) {
+            // Both present and different: interpolate.
+            (Some(a), Some(b)) if a.ne(b) => {
+                $out.$field = Some(a.interpolate(b, $t));
+            }
+            // Both present and equal: `cur` already holds this value, skip.
+            (Some(_), Some(_)) => {}
+            // None <-> Some (appearance/disappearance): there is no neutral
+            // value to fade through at this layer (the inherited value lives
+            // in the style cascade), so snap to the target immediately to stay
+            // consistent with the slow path instead of retaining a stale
+            // `cur` value until the animation ends.
+            _ => {
+                $out.$field = $other.$field.clone();
+            }
         }
     };
 }
@@ -65,15 +75,29 @@ pub trait FastInterpolatable: Clone {
 impl Interpolatable for Hsla {
     #[inline]
     fn interpolate(&self, other: &Self, t: f32) -> Self {
-        let mut dt = other.h - self.h;
+        // Resolve the hue for achromatic endpoints (s == 0 or l == 0/1).
+        // An achromatic color has an arbitrary/meaningless hue (often 0),
+        // so interpolating it naively sweeps through random hues and causes
+        // visible color flicker. Inherit the opposing endpoint's hue instead.
+        let h_from = if self.s <= 0.0 || self.l <= 0.0 || self.l >= 1.0 {
+            other.h
+        } else {
+            self.h
+        };
+        let h_to = if other.s <= 0.0 || other.l <= 0.0 || other.l >= 1.0 {
+            self.h
+        } else {
+            other.h
+        };
 
+        // Shortest path around the hue wheel.
+        let mut dt = h_to - h_from;
         if dt > 0.5 {
             dt -= 1.0;
         } else if dt < -0.5 {
             dt += 1.0;
         }
-
-        let h = (self.h + dt * t).rem_euclid(1.0);
+        let h = (h_from + dt * t).rem_euclid(1.0);
 
         Hsla {
             h,
@@ -164,20 +188,26 @@ impl ShadowBackground {
     }
 
     fn get_effective_colors(&self) -> [LinearColorStop; 2] {
-        if self.colors[0].eq_none() && self.colors[1].eq_none() {
-            [
-                LinearColorStop {
-                    color: self.solid,
-                    percentage: 0.,
-                },
-                LinearColorStop {
-                    color: self.solid,
-                    percentage: 1.,
-                },
-            ]
-        } else {
-            self.colors.clone()
-        }
+        // Per-stop fallback: a `none` stop (transparent black placeholder) is
+        // replaced by `solid`, so a partially-unset gradient does not drag in
+        // an arbitrary h=0 transparent black that would cause hue flicker.
+        let fallback = |i: usize| LinearColorStop {
+            color: self.solid,
+            percentage: if i == 0 { 0. } else { 1. },
+        };
+
+        [
+            if self.colors[0].eq_none() {
+                fallback(0)
+            } else {
+                self.colors[0]
+            },
+            if self.colors[1].eq_none() {
+                fallback(1)
+            } else {
+                self.colors[1]
+            },
+        ]
     }
 }
 
