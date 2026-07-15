@@ -225,8 +225,12 @@ impl TransitionRegistry {
                     }
                 } else if let Some(mut state) = registry.states.get_mut(id) {
                     state.priority = AnimationPriority::Lowest;
-                    let (ver, dt) = state.pre_animated(*origin_duration);
+                    // Set the new target before pre_animated so that
+                    // is_reversing (which compares `to == cur`) is evaluated
+                    // against the correct target, matching the persistent
+                    // branch above.
                     state.to = state.origin.clone();
+                    let (ver, dt) = state.pre_animated(*origin_duration);
                     Self::background_animated_task(
                         id.clone(),
                         Event::NONE,

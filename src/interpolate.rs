@@ -75,6 +75,18 @@ pub trait FastInterpolatable: Clone {
 impl Interpolatable for Hsla {
     #[inline]
     fn interpolate(&self, other: &Self, t: f32) -> Self {
+        // Fast path: same hue/saturation/lightness, only alpha differs.
+        // This avoids any hue rotation entirely, which prevents flicker when
+        // animating visibility/opacity of a surface that keeps its color.
+        if self.h == other.h && self.s == other.s && self.l == other.l {
+            return Hsla {
+                h: self.h,
+                s: self.s,
+                l: self.l,
+                a: self.a + (other.a - self.a) * t,
+            };
+        }
+
         // Resolve the hue for achromatic endpoints (s == 0 or l == 0/1).
         // An achromatic color has an arbitrary/meaningless hue (often 0),
         // so interpolating it naively sweeps through random hues and causes
@@ -551,7 +563,13 @@ impl<T: FastInterpolatable + Default + PartialEq> State<T> {
     pub(crate) fn pre_animated(&mut self, dt: Duration) -> (usize, Duration) {
         self.version = self.version.wrapping_add(1);
 
-        let is_reversing = self.to == self.from;
+        // Decide whether this transition is a reversal (heading back toward the
+        // value currently shown on screen). Using `cur` is more robust than the
+        // stale `from`: when several transitions share one state and interrupt
+        // each other, `from` may hold an intermediate value from a previous
+        // leg, so `to == from` can be wrong. `to == cur` correctly captures
+        // "the new target equals what the user sees right now".
+        let is_reversing = self.to == self.cur;
 
         let actual_duration = if is_reversing {
             dt.mul_f32(self.progress)
