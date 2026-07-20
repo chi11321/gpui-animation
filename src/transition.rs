@@ -293,4 +293,15 @@ impl TransitionRegistry {
         TRANSITION_REGISTRY.active_animations.remove(id);
         TRANSITION_REGISTRY.saved_contexts.remove(id);
     }
+
+    /// Remove all stored animation states, active animations, and saved
+    /// contexts. Call this when tearing down an entire view (e.g. on window
+    /// close or full re-mount) to avoid carrying over stale transition state
+    /// from unrelated elements.
+    pub fn reset_all_states() {
+        TRANSITION_REGISTRY.states.clear();
+        TRANSITION_REGISTRY.active_animations.clear();
+        TRANSITION_REGISTRY.saved_contexts.clear();
+        let _ = TRANSITION_REGISTRY.wakeup_tx.try_send(());
+    }
 }
