@@ -167,6 +167,10 @@ impl TransitionRegistry {
             ids.extend(registry.active_animations.iter().map(|e| e.key().clone()));
 
             let mut changed = false;
+            // Whether any animation still needs another frame. Not the same as
+            // `changed`: an animation that just finished (or just reached its
+            // target) needs one last repaint but nothing more.
+            let mut pending = false;
 
             for id in &ids {
                 let Some(active) = registry.active_animations.get(id) else {
@@ -178,7 +182,10 @@ impl TransitionRegistry {
                     continue;
                 };
 
-                changed = true;
+                // Captured before `animated` advances it: the tick that carries
+                // a persistent animation onto its target still has to paint
+                // that frame, while every later tick has nothing to add.
+                let was_at_target = state.progress >= 1.0;
 
                 let done = state.animated(
                     active.ver,
@@ -187,18 +194,27 @@ impl TransitionRegistry {
                     active.persistent,
                 );
 
-                if done {
-                    if active.event.ne(&Event::NONE) {
-                        state.priority = AnimationPriority::Lowest;
-                        completed.push((
-                            id.clone(),
-                            active.origin_duration,
-                            active.transition.clone(),
-                        ));
+                match tick_step(done, active.persistent, was_at_target, state.progress) {
+                    TickStep::Finish => {
+                        changed = true;
+                        if active.event.ne(&Event::NONE) {
+                            state.priority = AnimationPriority::Lowest;
+                            completed.push((
+                                id.clone(),
+                                active.origin_duration,
+                                active.transition.clone(),
+                            ));
+                        }
+                        drop(active);
+                        drop(state);
+                        registry.active_animations.remove(id);
                     }
-                    drop(active);
-                    drop(state);
-                    registry.active_animations.remove(id);
+                    TickStep::Settle => changed = true,
+                    TickStep::Animate => {
+                        changed = true;
+                        pending = true;
+                    }
+                    TickStep::Idle => {}
                 }
             }
 
@@ -247,10 +263,16 @@ impl TransitionRegistry {
                 cx.update(|cx| cx.refresh_windows()).ok();
             }
 
-            if registry.active_animations.is_empty() {
-                registry.wakeup_rx.recv().await.ok();
-            } else {
+            // Park while nothing needs frames. The active-animation map being
+            // empty is not the right test: it also holds *settled* persistent
+            // animations (kept for reversal and for `save_persistent_context`),
+            // and treating those as work kept this loop waking 120 times a
+            // second to rediscover it had nothing to do. Anything that starts
+            // an animation wakes it through `background_animated_task`.
+            if pending {
                 smol::Timer::after(frame_duration).await;
+            } else {
+                registry.wakeup_rx.recv().await.ok();
             }
         }
     }
@@ -303,5 +325,73 @@ impl TransitionRegistry {
         TRANSITION_REGISTRY.active_animations.clear();
         TRANSITION_REGISTRY.saved_contexts.clear();
         let _ = TRANSITION_REGISTRY.wakeup_tx.try_send(());
+    }
+}
+
+/// What one tick should do with a single tracked animation.
+#[derive(Debug, PartialEq, Eq)]
+enum TickStep {
+    /// Finished: drop the entry and repaint its final frame.
+    Finish,
+    /// Persistent and just reached its target: repaint this frame, then keep
+    /// the entry settled (see [`TickStep::Idle`]).
+    Settle,
+    /// Settled persistent entry, already painted: keep it, request nothing.
+    Idle,
+    /// Still animating: repaint and schedule another frame.
+    Animate,
+}
+
+/// Classify one tracked animation for the current tick.
+///
+/// A *persistent* animation (the hover case — see
+/// `AnimatedWrapper::animated_handle_persistent`) is deliberately kept in the
+/// registry after it reaches its target: `State::animated` reports "not
+/// finished" for it so that the entry survives, because its style is what an
+/// unhover re-animates from and `save_persistent_context` keys off
+/// `ActiveAnimation::persistent`. Kept is not the same as *busy* though, and
+/// conflating the two is expensive: a hovered element would flag the registry
+/// as changed on every 8.3 ms tick, so `refresh_windows()` re-rendered and
+/// repainted every window at 120 Hz for as long as the pointer rested on any
+/// animated element.
+///
+/// `was_at_target` is the progress from the previous tick: the tick that
+/// carries a persistent animation onto its target still needs its final
+/// frame painted, so it reports [`TickStep::Settle`].
+fn tick_step(done: bool, persistent: bool, was_at_target: bool, progress: f32) -> TickStep {
+    if done {
+        return TickStep::Finish;
+    }
+    if persistent && progress >= 1.0 {
+        return if was_at_target {
+            TickStep::Idle
+        } else {
+            TickStep::Settle
+        };
+    }
+    TickStep::Animate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TickStep, tick_step};
+
+    /// The tick that finishes an animation still repaints; the tick that
+    /// carries a persistent one onto its target repaints once and then goes
+    /// idle, no matter how many times the ticker runs afterwards.
+    #[test]
+    fn persistent_animation_settles_and_then_stops_requesting_frames() {
+        // In flight: repaint and keep ticking.
+        assert_eq!(tick_step(false, true, false, 0.4), TickStep::Animate);
+
+        // Reached the target on this tick: one last repaint.
+        assert_eq!(tick_step(false, true, false, 1.0), TickStep::Settle);
+
+        // Every later tick has nothing left to draw.
+        assert_eq!(tick_step(false, true, true, 1.0), TickStep::Idle);
+
+        // A non-persistent animation is dropped once it completes.
+        assert_eq!(tick_step(true, false, false, 1.0), TickStep::Finish);
+        assert_eq!(tick_step(true, true, false, 1.0), TickStep::Finish);
     }
 }
